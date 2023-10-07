@@ -40,6 +40,7 @@ from Products.PluginIndexes.interfaces import ITransposeQuery
 from Products.PluginIndexes.util import safe_callable
 from Products.ZCatalog.CatalogBrains import AbstractCatalogBrain
 from Products.ZCatalog.CatalogBrains import NoBrainer
+from Products.ZCatalog.LazyBrain import LazyBrain
 from Products.ZCatalog.plan import CatalogPlan
 from Products.ZCatalog.ProgressHandler import ZLogHandler
 from Products.ZCatalog.query import IndexQuery
@@ -47,6 +48,11 @@ from Products.ZCatalog.query import IndexQuery
 
 LOG = logging.getLogger('Zope.ZCatalog')
 
+#import time
+#global COUNTER
+#global COUNTER_TS
+#COUNTER = 0
+#COUNTER_TS = time.time()
 
 class CatalogError(Exception):
     pass
@@ -62,6 +68,12 @@ class Catalog(Persistent, Acquisition.Implicit, ExtensionClass.Base):
     This class is not Zope specific, and can be used in any python
     program to build catalogs of objects.  Note that it does require
     the objects to be Persistent, and thus must be used with ZODB3.
+
+    performance-optimazations in 2023:
+    - was done in a way which should not break anything also on very old instances
+    - that is why some changes a done in an ugly way behind the _v_is_lazy_brain flag
+    - TODO: check if a call of updateBrains is needed if add/update/delete index is called
+
     """
 
     _v_brains = NoBrainer
@@ -125,6 +137,11 @@ class Catalog(Persistent, Acquisition.Implicit, ExtensionClass.Base):
         """ initialize your brains.  This method is called when the
         catalog is first activated (from the persistent storage) """
         Persistent.__setstate__(self, state)
+        self._v_brains = LazyBrain # TODO: make this default-setting customizeable, perhaps an environment-varible as feature-flag
+        self._v_needs_maintain_zodb_cache = False
+        parent = aq_parent(self)
+        if hasattr(aq_base(parent), 'maintain_zodb_cache'): # TODO: Check if parent is available at this early state
+            self._v_needs_maintain_zodb_cache = True
         self.updateBrains()
 
     def useBrains(self, brains):
@@ -133,20 +150,39 @@ class Catalog(Persistent, Acquisition.Implicit, ExtensionClass.Base):
         Btree.
         """
 
-        class mybrains(AbstractCatalogBrain, brains):  # NOQA
-            pass
+        self._v_is_lazy_brain = brains and brains.__name__ == "LazyBrain" #isinstance(brains, LazyBrain)
 
-        scopy = self.schema.copy()
+        if not self._v_is_lazy_brain:
+            raise Exception('test')
+            class mybrainsnotlazy2(AbstractCatalogBrain, brains):  # NOQA
+                pass
 
-        schema_len = len(self.schema.keys())
-        scopy['data_record_id_'] = schema_len
-        scopy['data_record_score_'] = schema_len + 1
-        scopy['data_record_normalized_score_'] = schema_len + 2
+            scopy = self.schema.copy()
 
-        mybrains.__record_schema__ = scopy
+            schema_len = len(self.schema.keys())
+            scopy['data_record_id_'] = schema_len
+            scopy['data_record_score_'] = schema_len + 1
+            scopy['data_record_normalized_score_'] = schema_len + 2
 
-        self._v_brains = brains
-        self._v_result_class = mybrains
+            mybrainsnotlazy2.__record_schema__ = scopy
+
+            self._v_brains = brains
+            self._v_result_class = mybrainsnotlazy2
+
+        else:
+            class mylazybrains2(brains): # NOQA
+                pass
+            keys = list(self.schema.keys())
+            class myschema: # NOQA
+                __slots__ = keys
+                __LEN__ = len(keys)
+                def __init__(self, schema):
+                    for key in schema:
+                        setattr(self, key, schema[key])
+            mylazybrains2.__record_schema__ = myschema(self.schema)
+
+            self._v_brains = brains
+            self._v_result_class = mylazybrains2
 
     def addColumn(self, name, default_value=None, threshold=10000):
         """Adds a row to the meta data schema"""
@@ -427,27 +463,54 @@ class Catalog(Persistent, Acquisition.Implicit, ExtensionClass.Base):
         """ internal method: create and initialise search result object.
         record should be a tuple of (document RID, metadata columns tuple),
         score_data can be a tuple of (scode, normalized score) or be omitted"""
-        self._maintain_zodb_cache()
-        key, data = record
-        klass = self._v_result_class
-        if score_data:
-            score, normalized_score = score_data
-            schema_len = len(klass.__record_schema__)
-            if schema_len == len(data) + 3:
-                # if we have complete data, create in a single pass
-                data = tuple(data) + (key, score, normalized_score)
-                return klass(data).__of__(aq_parent(self))
-        r = klass(data)
-        r.data_record_id_ = key
-        if score_data:
-            # preserved during refactoring for compatibility reasons:
-            # can only be reached if score_data is present,
-            # but schema length is not equal to len(data) + 3
-            # no known use cases
-            r.data_record_score_ = score
-            r.data_record_normalized_score_ = normalized_score
-            return r.__of__(aq_parent(self))
-        return r.__of__(self)
+        #global COUNTER
+        #global COUNTER_TS
+        #ts = int(time.time())
+        #if (COUNTER_TS + 10) > ts:
+        #    COUNTER += 1
+        #else:
+        #    COUNTER = 1
+        #    COUNTER_TS = ts 
+        #print('%04d: %04d %s' % (COUNTER, ts-COUNTER_TS, record[0]))
+        if self._v_is_lazy_brain:
+            if self._v_needs_maintain_zodb_cache:
+                aq_base(parent).maintain_zodb_cache()
+            r = self._v_result_class(record[1])
+            r.data_record_id_ = record[0]
+            if score_data:
+                # preserved during refactoring for compatibility reasons:
+                # can only be reached if score_data is present,
+                # but schema length is not equal to len(data) + 3
+                # no known use cases
+                r.data_record_score_ = score_data[0]
+                r.data_record_normalized_score_ = score_data[1]
+                parent = aq_parent(self)
+                r.__context__ = parent
+                return r.__of__(parent)
+            r.__context__ = self
+            return r.__of__(self)
+        else:
+            self.maintain_zodb_cache()
+            key, data = record
+            klass = self._v_result_class
+            if score_data:
+                score, normalized_score = score_data
+                schema_len = len(klass.__record_schema__)
+                if schema_len == len(data) + 3:
+                    # if we have complete data, create in a single pass
+                    data = tuple(data) + (key, score, normalized_score)
+                    return klass(data).__of__(aq_parent(self))
+            r = klass(data)
+            r.data_record_id_ = key
+            if score_data:
+                # preserved during refactoring for compatibility reasons:
+                # can only be reached if score_data is present,
+                # but schema length is not equal to len(data) + 3
+                # no known use cases
+                r.data_record_score_ = score
+                r.data_record_normalized_score_ = normalized_score
+                return r.__of__(aq_parent(self))
+            return r.__of__(self)
 
     def getMetadataForRID(self, rid):
         record = self.data[rid]
